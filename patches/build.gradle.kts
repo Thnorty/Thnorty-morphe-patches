@@ -4,12 +4,12 @@ group = "app.morphe"
 
 patches {
     about {
-        name = "Morphe Patches"
-        description = "Patches for Morphe"
-        source = "git@github.com:MorpheApp/morphe-patches.git"
-        author = "MorpheApp"
-        contact = "na"
-        website = "https://morphe.software"
+        name = "Thnorty patches"
+        description = "Morphe Patches with additional patches by Thnorty"
+        source = "git@github.com:Thnorty/morphe-patches.git"
+        author = "Thnorty"
+        contact = "https://github.com/Thnorty/morphe-patches/issues"
+        website = "https://github.com/Thnorty/morphe-patches"
         license = "GNU General Public License v3.0, with additional GPL section 7 requirements"
     }
 }
