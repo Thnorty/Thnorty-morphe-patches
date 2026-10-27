@@ -13,6 +13,7 @@ import static app.morphe.extension.shared.settings.Setting.migrateOldSettingToNe
 import app.morphe.extension.shared.settings.BaseSettings;
 import app.morphe.extension.shared.settings.BooleanSetting;
 import app.morphe.extension.shared.settings.FloatSetting;
+import app.morphe.extension.shared.settings.IntegerSetting;
 import app.morphe.extension.shared.settings.StringSetting;
 
 public class Settings extends BaseSettings {
@@ -46,6 +47,9 @@ public class Settings extends BaseSettings {
     public static final BooleanSetting HIDE_REDDIT_PRO_SHELF = new BooleanSetting("morphe_hide_reddit_pro_shelf", FALSE, true);
     public static final BooleanSetting HIDE_TRENDING_SHELVES = new BooleanSetting("morphe_hide_trending_shelves", FALSE, true);
     public static final BooleanSetting KEEP_FEED_POSITION = new BooleanSetting("morphe_keep_feed_position", TRUE);
+    public static final IntegerSetting MIN_SCORE_DEFAULT = new IntegerSetting("morphe_min_score_default", 0);
+    public static final StringSetting MIN_SCORE_RULES = new StringSetting("morphe_min_score_rules", "");
+    public static final StringSetting MIN_SCORE_SEEN_SUBREDDITS = new StringSetting("morphe_min_score_seen_subreddits", "", false, false);
     public static final BooleanSetting MEDIA_VIEWER_BLACK_BACKGROUND = new BooleanSetting("morphe_media_viewer_black_background", FALSE);
     public static final FloatSetting MEDIA_VIEWER_FADE = new FloatSetting("morphe_media_viewer_fade", 1f);
     public static final BooleanSetting REMOVE_NSFW_DIALOG = new BooleanSetting("morphe_remove_nsfw_dialog", FALSE, true);

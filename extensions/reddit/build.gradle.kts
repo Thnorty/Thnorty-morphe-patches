@@ -1,6 +1,8 @@
 import com.android.build.api.dsl.ApplicationExtension
 
 dependencies {
+    testImplementation(libs.junit)
+
     compileOnly(project(":extensions:shared:library"))
     compileOnly(project(":extensions:reddit:stub"))
     compileOnly(libs.morphe.extensions.library)
