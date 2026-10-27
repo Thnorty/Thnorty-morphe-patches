@@ -27,6 +27,7 @@ import app.morphe.extension.reddit.patches.HideTrendingShelvesPatch;
 import app.morphe.extension.reddit.patches.KeepFeedPositionPatch;
 import app.morphe.extension.reddit.patches.MediaViewerBlackBackgroundPatch;
 import app.morphe.extension.reddit.patches.MediaViewerFadePatch;
+import app.morphe.extension.reddit.patches.MinScoreFilterPatch;
 import app.morphe.extension.reddit.patches.RememberCollapsedCommentsPatch;
 import app.morphe.extension.reddit.patches.RemoveSubRedditDialogPatch;
 import app.morphe.extension.reddit.patches.ShowFlairsInHomeFeedPatch;
@@ -36,6 +37,7 @@ import app.morphe.extension.reddit.settings.preference.BooleanSettingPreference;
 import app.morphe.extension.reddit.settings.preference.CustomFontFilePreference;
 import app.morphe.extension.reddit.settings.preference.CustomFontTogglePreference;
 import app.morphe.extension.reddit.settings.preference.ForceSystemFontPreference;
+import app.morphe.extension.reddit.settings.preference.MinScoreRulesPreference;
 import app.morphe.extension.reddit.settings.preference.NumberSettingPreference;
 import app.morphe.extension.shared.Utils;
 
@@ -58,6 +60,7 @@ public class LayoutPreferenceCategory extends ConditionalPreferenceCategory {
                 HideTrendingShelvesPatch.isPatchIncluded() ||
                 FullWidthFeedMediaPatch.isPatchIncluded() ||
                 MediaViewerFadePatch.isPatchIncluded() ||
+                MinScoreFilterPatch.isPatchIncluded() ||
                 KeepFeedPositionPatch.isPatchIncluded() ||
                 FeedMediaMaxHeightPatch.isPatchIncluded() ||
                 HideMediaViewerComponentsPatch.isPatchIncluded() ||
@@ -154,6 +157,10 @@ public class LayoutPreferenceCategory extends ConditionalPreferenceCategory {
                     context,
                     Settings.MEDIA_VIEWER_FADE
             ));
+        }
+
+        if (MinScoreFilterPatch.isPatchIncluded()) {
+            addPreference(new MinScoreRulesPreference(context));
         }
 
         if (KeepFeedPositionPatch.isPatchIncluded()) {
