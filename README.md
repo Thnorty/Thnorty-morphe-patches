@@ -11,7 +11,7 @@ Every patch of the official bundle is included, so this source replaces it.
 
 ## Use in Morphe
 
-Add `github.com/Thnorty/Thnorty-patches` as a source in Morphe (**Sources** → **+** → **Remote**),
+Add `github.com/Thnorty/Thnorty-morphe-patches` as a source in Morphe (**Sources** → **+** → **Remote**),
 then disable the official Morphe Patches source for the apps you patch with this one.
 
 Turn on **Pre-release patches** for this source to follow the official pre-releases.

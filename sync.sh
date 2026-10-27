@@ -17,7 +17,7 @@
 set -euo pipefail
 
 channel="${1:?usage: sync.sh stable|dev}"
-repository="${GITHUB_REPOSITORY:-Thnorty/Thnorty-patches}"
+repository="${GITHUB_REPOSITORY:-Thnorty/Thnorty-morphe-patches}"
 features_ref="${FEATURES_REF:-origin/features}"
 dry_run="${DRY_RUN:-0}"
 
