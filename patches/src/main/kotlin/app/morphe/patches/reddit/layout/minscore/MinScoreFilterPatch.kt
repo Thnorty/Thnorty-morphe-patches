@@ -17,15 +17,17 @@ import app.morphe.patcher.util.proxy.mutableTypes.MutableMethod.Companion.toMuta
 import app.morphe.patches.reddit.misc.settings.settingsPatch
 import app.morphe.patches.reddit.misc.version.versionCheckPatch
 import app.morphe.patches.reddit.shared.Constants.COMPATIBILITY_REDDIT
-import app.morphe.util.getReference
 import app.morphe.util.setExtensionIsPatchIncluded
 import com.android.tools.smali.dexlib2.AccessFlags
 import com.android.tools.smali.dexlib2.Opcode
 import com.android.tools.smali.dexlib2.builder.MutableMethodImplementation
 import com.android.tools.smali.dexlib2.iface.ClassDef
+import com.android.tools.smali.dexlib2.iface.instruction.Instruction
+import com.android.tools.smali.dexlib2.iface.instruction.ReferenceInstruction
 import com.android.tools.smali.dexlib2.iface.instruction.TwoRegisterInstruction
 import com.android.tools.smali.dexlib2.iface.reference.FieldReference
 import com.android.tools.smali.dexlib2.iface.reference.MethodReference
+import com.android.tools.smali.dexlib2.iface.reference.Reference
 import com.android.tools.smali.dexlib2.immutable.ImmutableMethod
 
 private const val EXTENSION_CLASS =
@@ -51,6 +53,13 @@ private const val SUBREDDIT_FEED_PARAMS_INTERFACE =
 private fun ClassDef.fieldOfType(type: String): FieldReference =
     fields.singleOrNull { it.type == type }
         ?: throw PatchException("Expected exactly one field of type $type in ${this.type}")
+
+/**
+ * The reference of the instruction, if it has one of this type.
+ * Uses dexlib2 directly, since the patcher's helper moved between patcher versions.
+ */
+private inline fun <reified T : Reference> Instruction.reference(): T? =
+    (this as? ReferenceInstruction)?.reference as? T
 
 private fun registerWidth(type: CharSequence): Int = if (type.toString() in setOf("J", "D")) 2 else 1
 
@@ -89,7 +98,7 @@ private fun ClassDef.fieldFromConstructorParameter(index: Int, expectedType: Str
                 null
             }
             opcodeName.startsWith("iput") && instruction.registerA in parameterRegisters &&
-                    instruction.registerB in thisRegisters -> instruction.getReference<FieldReference>()
+                    instruction.registerB in thisRegisters -> instruction.reference<FieldReference>()
             else -> null
         }
     } ?: throw PatchException("Constructor parameter $index is not assigned to a field in $type")
@@ -208,7 +217,7 @@ val minScoreFilterPatch = bytecodePatch(
         FetchSubredditFeedFingerprint.method.apply {
             val mapIndex = instructions.indexOfFirst { instruction ->
                 instruction.opcode == Opcode.INVOKE_VIRTUAL &&
-                        instruction.getReference<MethodReference>()?.parameterTypes?.lastOrNull()
+                        instruction.reference<MethodReference>()?.parameterTypes?.lastOrNull()
                             ?.toString() == edgeFragmentContextType
             }
             if (mapIndex < 0) throw PatchException("Could not find cell group mapping call")
@@ -216,7 +225,7 @@ val minScoreFilterPatch = bytecodePatch(
             val paramsRegister = (mapIndex - 1 downTo 0).firstNotNullOfOrNull { index ->
                 val instruction = instructions[index]
                 if (instruction.opcode == Opcode.IGET_OBJECT &&
-                    instruction.getReference<FieldReference>()?.definingClass == subredditFeedParamsClass.type
+                    instruction.reference<FieldReference>()?.definingClass == subredditFeedParamsClass.type
                 ) {
                     (instruction as TwoRegisterInstruction).registerB
                 } else {
