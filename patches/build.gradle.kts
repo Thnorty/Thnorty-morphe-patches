@@ -6,10 +6,10 @@ patches {
     about {
         name = "Thnorty patches"
         description = "Morphe Patches with additional patches by Thnorty"
-        source = "git@github.com:Thnorty/morphe-patches.git"
+        source = "git@github.com:Thnorty/Thnorty-patches.git"
         author = "Thnorty"
-        contact = "https://github.com/Thnorty/morphe-patches/issues"
-        website = "https://github.com/Thnorty/morphe-patches"
+        contact = "https://github.com/Thnorty/Thnorty-patches/issues"
+        website = "https://github.com/Thnorty/Thnorty-patches"
         license = "GNU General Public License v3.0, with additional GPL section 7 requirements"
     }
 }
