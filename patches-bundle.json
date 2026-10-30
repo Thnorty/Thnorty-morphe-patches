@@ -1,0 +1,7 @@
+{
+  "created_at": "2026-10-30T13:02:44",
+  "description": "Official Morphe Patches [v2.0.0](https://github.com/MorpheApp/morphe-patches/releases/tag/v2.0.0) with:\n\n- feat(Reddit): Add `Hide low score posts` patch\n- chore: Rename the bundle to Thnorty patches\n- fix(Reddit - Hide low score posts): Build with both patcher versions\n- chore: Update repository links\n- chore: Update repository links for the new repository name",
+  "download_url": "https://github.com/Thnorty/Thnorty-morphe-patches/releases/download/v2.0.0-thnorty.cde6e84/thnorty-patches-2.0.0-thnorty.cde6e84.mpp",
+  "signature_download_url": "",
+  "version": "2.0.0-thnorty.cde6e84"
+}
