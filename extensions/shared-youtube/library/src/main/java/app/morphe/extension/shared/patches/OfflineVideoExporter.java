@@ -1,0 +1,1583 @@
+/*
+ * Copyright 2026 Morphe.
+ * https://github.com/MorpheApp/morphe-patches/pull/4211
+ * https://github.com/MorpheApp/morphe-patches/pull/5043
+ *
+ * See the included NOTICE file for GPLv3 Section 7 terms that apply to this code.
+ */
+
+package app.morphe.extension.shared.patches;
+
+import static app.morphe.extension.shared.StringRef.str;
+import static app.morphe.extension.shared.patches.AppCheckPatch.IS_YOUTUBE_MUSIC;
+
+import android.annotation.SuppressLint;
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
+import android.content.BroadcastReceiver;
+import android.content.ContentResolver;
+import android.content.ContentValues;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
+import android.content.UriPermission;
+import android.database.Cursor;
+import android.database.sqlite.SQLiteDatabase;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.graphics.drawable.Icon;
+import android.media.MediaCodec;
+import android.media.MediaDataSource;
+import android.media.MediaExtractor;
+import android.media.MediaFormat;
+import android.media.MediaMuxer;
+import android.net.Uri;
+import android.os.Build;
+import android.os.Environment;
+import android.os.ParcelFileDescriptor;
+import android.provider.DocumentsContract;
+import android.provider.MediaStore;
+import android.util.Base64;
+
+import androidx.annotation.Nullable;
+import androidx.annotation.RequiresApi;
+
+import java.io.BufferedInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.io.RandomAccessFile;
+import java.nio.ByteBuffer;
+import java.nio.file.Files;
+import java.security.GeneralSecurityException;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.function.Supplier;
+
+import javax.crypto.Cipher;
+import javax.crypto.CipherInputStream;
+import javax.crypto.spec.IvParameterSpec;
+import javax.crypto.spec.SecretKeySpec;
+
+import app.morphe.extension.shared.Logger;
+import app.morphe.extension.shared.Utils;
+import app.morphe.extension.shared.innertube.PlayerResponseOuterClass.ThumbnailEntry;
+import app.morphe.extension.shared.innertube.PlayerResponseOuterClass.ThumbnailList;
+import app.morphe.extension.shared.innertube.SavedVideo.OfflineMusicMetadata;
+import app.morphe.extension.shared.innertube.SavedVideo.OfflinePlaylistData;
+import app.morphe.extension.shared.innertube.SavedVideo.OfflineVideoData;
+import app.morphe.extension.shared.innertube.SavedVideo.SavedPlayerResponse;
+import app.morphe.extension.shared.settings.SharedYouTubeSettings;
+
+/**
+ * Exports a video or song saved by the app to a file in the shared Download folder.
+ * YouTube and YouTube Music save them the same way.
+ * <p>
+ * The app keeps each saved stream in an ExoPlayer cache, encrypted with AES/CTR
+ * using a key from the app preferences. The streams are decrypted while they are read,
+ * and the video and audio streams are muxed into one file. A single stream, such as
+ * the audio of a song, is saved as it is.
+ */
+@SuppressWarnings("unused")
+public final class OfflineVideoExporter {
+
+    private static final String KEY_PREFERENCES_NAME = "youtube";
+    private static final String KEY_PREFERENCE = "downloads_encryption_key";
+
+    private static final String DATABASE_PREFIX = "offline.";
+    private static final String DATABASE_SUFFIX = ".db";
+    private static final String OFFLINE_FOLDER = "offline";
+    private static final String STREAMS_FOLDER = "streams";
+    private static final String CACHE_INDEX_FILE = "cached_content_index.exi";
+    private static final String SPAN_FILE_SUFFIX = ".v3.exo";
+    /**
+     * Playlist ids of albums start with this.
+     */
+    private static final String ALBUM_PLAYLIST_ID_PREFIX = "OLAK5uy_";
+    private static final String IMAGES_FOLDER = "data" + File.separator + "images";
+    private static final String IMAGE_JPEG = "image/jpeg";
+    private static final String IMAGE_PNG = "image/png";
+    private static final int ARTWORK_JPEG_QUALITY = 90;
+
+    private static final int CACHE_INDEX_VERSION = 2;
+    private static final int CACHE_INDEX_FLAG_ENCRYPTED = 1;
+    /**
+     * Streams saved with another encryption, such as streams of paid content, have a different key type.
+     */
+    private static final int ENCRYPTION_KEY_TYPE_CACHE = 0;
+
+    private static final String CACHE_CIPHER = "AES/CTR/NoPadding";
+    private static final String INDEX_CIPHER = "AES/CBC/PKCS5Padding";
+    private static final int AES_BLOCK_SIZE = 16;
+
+    private static final String SAVE_FOLDER = IS_YOUTUBE_MUSIC ? "Morphe music" : "Morphe videos";
+    /**
+     * The folder used by default with Android 10 and newer, in the device storage.
+     */
+    private static final String DEFAULT_FOLDER = Environment.DIRECTORY_DOWNLOADS + File.separator + SAVE_FOLDER;
+    /**
+     * Document id of the device storage volume, before the path of a folder in it.
+     */
+    private static final String PRIMARY_VOLUME_PREFIX = "primary:";
+    private static final int FOLDER_PERMISSIONS =
+            Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION;
+    private static final int MAX_FILE_NAME_LENGTH = 100;
+    /**
+     * How many numbered names are tried if a file with the name already exists.
+     */
+    private static final int MAX_FILE_NAME_ATTEMPTS = 100;
+    private static final int SAMPLE_BUFFER_SIZE = 4 * 1024 * 1024;
+    private static final int COPY_BUFFER_SIZE = 64 * 1024;
+
+    private static final String NOTIFICATION_CHANNEL = "morphe_video_exports";
+    /**
+     * The system drops notification updates that are posted too often.
+     */
+    private static final long NOTIFICATION_INTERVAL_MILLISECONDS = 1000;
+    private static final int PROGRESS_MAX = 100;
+    private static final String CANCEL_ACTION_PREFIX = "app.morphe.extension.shared.EXPORT_CANCEL.";
+    /**
+     * Notification of an export of several videos, such as an album.
+     */
+    private static final int EXPORT_LIST_NOTIFICATION_ID = CANCEL_ACTION_PREFIX.hashCode();
+
+    /**
+     * Same as MediaFormat.MIMETYPE_VIDEO_AV1, which is only available with Android 10 and newer.
+     */
+    private static final String MIMETYPE_VIDEO_AV1 = "video/av01";
+
+    /**
+     * MediaMuxer can write AV1 to MP4 files starting with Android 14.
+     */
+    private static final int AV1_MUXER_MIN_SDK = 34;
+
+    private static final String OGG_MIME_TYPE = "audio/ogg";
+
+    private static final Set<String> WEBM_MIME_TYPES = Set.of(
+            MediaFormat.MIMETYPE_VIDEO_VP8,
+            MediaFormat.MIMETYPE_VIDEO_VP9,
+            MediaFormat.MIMETYPE_AUDIO_OPUS,
+            MediaFormat.MIMETYPE_AUDIO_VORBIS
+    );
+
+    private static final Set<String> MP4_MIME_TYPES = Set.of(
+            MediaFormat.MIMETYPE_VIDEO_AVC,
+            MediaFormat.MIMETYPE_VIDEO_HEVC,
+            MIMETYPE_VIDEO_AV1,
+            MediaFormat.MIMETYPE_AUDIO_AAC
+    );
+
+    private record SavedStream(int itag, long length) {
+    }
+
+    /**
+     * @param database The database of the account that saved the video.
+     */
+    private record SavedVideo(String title, List<SavedStream> streams, File database) {
+        /**
+         * @return The size of all streams of the video.
+         */
+        long length() {
+            long length = 0;
+            for (SavedStream stream : streams) {
+                length += stream.length();
+            }
+            return length;
+        }
+    }
+
+    /**
+     * @param uri The exported video file, or null if it can't be opened by other apps.
+     */
+    private record ExportResult(String location, @Nullable Uri uri, String mimeType) {
+    }
+
+    /**
+     * @param folder The subfolder of the export folder the video is exported to, such as
+     *               the folder of its album, or null to export it to the export folder itself.
+     */
+    private record ExportItem(String videoId, @Nullable String folder) {
+    }
+
+    /**
+     * @param title The title of the notification of the export, such as the name of the album.
+     */
+    private record ExportList(String title, List<ExportItem> items) {
+    }
+
+    /**
+     * Thrown to stop an export that is canceled with the notification.
+     */
+    private static final class ExportCanceledException extends IOException {
+    }
+
+    /**
+     * If a list of saved videos is being exported. Set on the main thread, cleared when the exports end.
+     */
+    private static volatile boolean exportingList;
+
+    private OfflineVideoExporter() {
+    }
+
+    /**
+     * @return If the video is fully saved and can be exported.
+     */
+    public static boolean isExportable(String videoId) {
+        return getSavedVideo(videoId) != null;
+    }
+
+    /**
+     * Exports a saved video. Its notification shows the progress and the result of the export.
+     */
+    public static void exportVideo(String videoId) {
+        Utils.showToastShort(str("morphe_export_download_started"));
+
+        Utils.runOnBackgroundThread(() -> {
+            ExportNotification notification = null;
+            try {
+                SavedVideo video = getSavedVideo(videoId);
+                if (video == null) {
+                    throw new IllegalStateException("Video is not saved: " + videoId);
+                }
+
+                notification = new ExportNotification(videoId.hashCode(), video.title(), video.length());
+                ExportResult result = export(videoId, video, null, notification);
+                String text = str("morphe_export_download_saved", result.location());
+                notification.showResult(text, result.uri(), result.mimeType());
+                Utils.showToastLong(text);
+            } catch (ExportCanceledException ex) {
+                Logger.printDebug(() -> "Export canceled: " + videoId);
+                notification.dismiss();
+                Utils.showToastShort(str("morphe_export_download_canceled"));
+            } catch (Exception ex) {
+                Logger.printException(() -> "exportVideo failure: " + videoId, ex);
+                String text = str("morphe_export_download_failed");
+                if (notification != null) {
+                    notification.showResult(text, null, null);
+                }
+                Utils.showToastLong(text);
+            }
+        });
+    }
+
+    /**
+     * @param limit The most videos to look for.
+     * @return The videos that are fully saved and can be exported.
+     */
+    public static List<String> getExportableVideoIds(int limit) {
+        Set<String> videoIds = new LinkedHashSet<>();
+        for (File database : getDatabases()) {
+            try (SQLiteDatabase db = SQLiteDatabase.openDatabase(
+                    database.getPath(), null, SQLiteDatabase.OPEN_READONLY);
+                 Cursor cursor = db.query(true, "streams", new String[]{"video_id"},
+                         null, null, null, null, null, null)) {
+                while (cursor.moveToNext()) {
+                    if (videoIds.size() >= limit) {
+                        return new ArrayList<>(videoIds);
+                    }
+                    String videoId = cursor.getString(0);
+                    if (videoId != null && getSavedStreams(db, videoId) != null) {
+                        videoIds.add(videoId);
+                    }
+                }
+            }
+        }
+        return new ArrayList<>(videoIds);
+    }
+
+    /**
+     * @return The videos of the saved playlist or album that are fully saved and can be exported,
+     *         in the order of the playlist.
+     */
+    public static List<String> getExportablePlaylistVideoIds(String playlistId) {
+        Set<String> videoIds = new LinkedHashSet<>();
+        for (File database : getDatabases()) {
+            try (SQLiteDatabase db = SQLiteDatabase.openDatabase(
+                    database.getPath(), null, SQLiteDatabase.OPEN_READONLY)) {
+                videoIds.addAll(getExportablePlaylistVideoIds(db, playlistId));
+            }
+        }
+        return new ArrayList<>(videoIds);
+    }
+
+    private static List<String> getExportablePlaylistVideoIds(SQLiteDatabase db, String playlistId) {
+        List<String> videoIds = new ArrayList<>();
+        try (Cursor cursor = db.query("playlist_video", new String[]{"video_id"},
+                "playlist_id = ?", new String[]{playlistId},
+                null, null, "index_in_playlist")) {
+            while (cursor.moveToNext()) {
+                String videoId = cursor.getString(0);
+                if (videoId != null && getSavedStreams(db, videoId) != null) {
+                    videoIds.add(videoId);
+                }
+            }
+        }
+        return videoIds;
+    }
+
+    /**
+     * @return The name of the folder the videos of a saved playlist or album are exported to,
+     *         such as "Artist - Album" for an album.
+     */
+    private static String getPlaylistFolder(SQLiteDatabase db, String playlistId) {
+        try (Cursor cursor = db.query("playlistsV13", new String[]{"offline_playlist_data_proto"},
+                "id = ?", new String[]{playlistId}, null, null, null)) {
+            if (cursor.moveToFirst() && !cursor.isNull(0)) {
+                OfflinePlaylistData data = OfflinePlaylistData.parseFrom(cursor.getBlob(0));
+                String title = data.getTitle();
+                // The owner of an album is its artist. The owner of other playlists is the user
+                // or a channel, which is not added.
+                String artist = data.getOwner().getChannel().getName();
+                if (playlistId.startsWith(ALBUM_PLAYLIST_ID_PREFIX) && !artist.isEmpty() && !title.isEmpty()) {
+                    title = artist + " - " + title;
+                }
+                String folder = getFileName(title);
+                if (!folder.isEmpty()) {
+                    return folder;
+                }
+            }
+        } catch (Exception ex) {
+            Logger.printException(() -> "Could not read the title of playlist: " + playlistId, ex);
+        }
+        return playlistId;
+    }
+
+    /**
+     * Exports all saved videos, one after another, in the folders of their saved playlists
+     * and albums like the downloads of the app. Videos saved by themselves are exported
+     * to the export folder. Canceling one of the exports stops the others too.
+     */
+    public static void exportAllVideos() {
+        exportVideos(str("morphe_export_download_all_started"), () -> {
+            Set<ExportItem> items = new LinkedHashSet<>();
+            Set<String> playlistVideoIds = new HashSet<>();
+            for (File database : getDatabases()) {
+                try (SQLiteDatabase db = SQLiteDatabase.openDatabase(
+                        database.getPath(), null, SQLiteDatabase.OPEN_READONLY);
+                     Cursor cursor = db.query("playlistsV13", new String[]{"id"},
+                             null, null, null, null, "saved_timestamp")) {
+                    while (cursor.moveToNext()) {
+                        String playlistId = cursor.getString(0);
+                        String folder = getPlaylistFolder(db, playlistId);
+                        for (String videoId : getExportablePlaylistVideoIds(db, playlistId)) {
+                            items.add(new ExportItem(videoId, folder));
+                            playlistVideoIds.add(videoId);
+                        }
+                    }
+                }
+            }
+
+            for (String videoId : getExportableVideoIds(Integer.MAX_VALUE)) {
+                if (!playlistVideoIds.contains(videoId)) {
+                    items.add(new ExportItem(videoId, null));
+                }
+            }
+            return new ExportList(str("morphe_export_download_all_title"), new ArrayList<>(items));
+        });
+    }
+
+    /**
+     * Exports the saved videos of a playlist or album to a folder named after it, one after another.
+     * Canceling one of the exports stops the others too.
+     */
+    public static void exportPlaylistVideos(String playlistId) {
+        exportVideos(str("morphe_export_download_playlist_started"), () -> {
+            for (File database : getDatabases()) {
+                try (SQLiteDatabase db = SQLiteDatabase.openDatabase(
+                        database.getPath(), null, SQLiteDatabase.OPEN_READONLY)) {
+                    List<String> videoIds = getExportablePlaylistVideoIds(db, playlistId);
+                    if (!videoIds.isEmpty()) {
+                        String folder = getPlaylistFolder(db, playlistId);
+                        List<ExportItem> items = new ArrayList<>();
+                        for (String videoId : videoIds) {
+                            items.add(new ExportItem(videoId, folder));
+                        }
+                        return new ExportList(folder, items);
+                    }
+                }
+            }
+            return new ExportList(playlistId, List.of());
+        });
+    }
+
+    /**
+     * Exports the videos one after another. One notification shows the progress of all of them,
+     * and canceling it stops the export.
+     *
+     * @param list Called on a background thread, returns the videos to export.
+     */
+    private static void exportVideos(String startedText, Supplier<ExportList> list) {
+        if (exportingList) {
+            Utils.showToastShort(str("morphe_export_download_all_running"));
+            return;
+        }
+        exportingList = true;
+        Utils.showToastShort(startedText);
+
+        Utils.runOnBackgroundThread(() -> {
+            ExportNotification notification = null;
+            try {
+                ExportList exportList = list.get();
+                List<ExportItem> items = exportList.items();
+                // The videos are read first, so the progress is of the size of all videos.
+                List<SavedVideo> videos = new ArrayList<>();
+                long length = 0;
+                for (ExportItem item : items) {
+                    SavedVideo video = getSavedVideo(item.videoId());
+                    videos.add(video);
+                    if (video != null) {
+                        length += video.length();
+                    }
+                }
+
+                notification = new ExportNotification(EXPORT_LIST_NOTIFICATION_ID, exportList.title(), length);
+                int exported = 0;
+                for (int i = 0, size = items.size(); i < size; i++) {
+                    ExportItem item = items.get(i);
+                    SavedVideo video = videos.get(i);
+                    if (video == null) {
+                        Logger.printInfo(() -> "Video is not saved anymore: " + item.videoId());
+                        continue;
+                    }
+
+                    notification.setVideo(video.title());
+                    try {
+                        export(item.videoId(), video, item.folder(), notification);
+                        exported++;
+                    } catch (ExportCanceledException ex) {
+                        throw ex;
+                    } catch (Exception ex) {
+                        Logger.printException(() -> "Could not export: " + item.videoId(), ex);
+                    }
+                    notification.finishVideo(video.length());
+                }
+
+                final int exportedCount = exported;
+                Logger.printDebug(() -> "Exported " + exportedCount + " of " + items.size() + " videos");
+                String text = str("morphe_export_download_all_saved", exportedCount, items.size(), getFolderName());
+                notification.showResult(text, null, null);
+                Utils.showToastLong(text);
+            } catch (ExportCanceledException ex) {
+                Logger.printDebug(() -> "Export canceled");
+                notification.dismiss();
+                Utils.showToastShort(str("morphe_export_download_canceled"));
+            } catch (Exception ex) {
+                Logger.printException(() -> "exportVideos failure", ex);
+                String text = str("morphe_export_download_failed");
+                if (notification != null) {
+                    notification.showResult(text, null, null);
+                }
+                Utils.showToastLong(text);
+            } finally {
+                exportingList = false;
+            }
+        });
+    }
+
+    /**
+     * @return The folder videos are exported to, as shown to the user.
+     */
+    public static String getFolderName() {
+        String folder = SharedYouTubeSettings.EXPORT_DOWNLOAD_FOLDER.get();
+        if (folder.isEmpty()) {
+            return Build.VERSION.SDK_INT < Build.VERSION_CODES.Q
+                    ? getLegacyFolder().getPath()
+                    : DEFAULT_FOLDER;
+        }
+
+        // Folders of the device storage have the volume and the path as id, such as "primary:Movies".
+        String documentId = DocumentsContract.getTreeDocumentId(Uri.parse(folder));
+        final int separator = documentId.indexOf(':');
+        return separator < 0 || separator == documentId.length() - 1
+                ? documentId
+                : documentId.substring(separator + 1);
+    }
+
+    /**
+     * @param folder The tree uri of the folder to export to, or null to use the default folder.
+     */
+    public static void setFolder(@Nullable Uri folder) {
+        ContentResolver resolver = Utils.getContext().getContentResolver();
+
+        // Only one folder is used, so the access to the previous folder is no longer needed.
+        String previous = SharedYouTubeSettings.EXPORT_DOWNLOAD_FOLDER.get();
+        for (UriPermission permission : resolver.getPersistedUriPermissions()) {
+            if (permission.getUri().toString().equals(previous)) {
+                resolver.releasePersistableUriPermission(permission.getUri(), FOLDER_PERMISSIONS);
+            }
+        }
+
+        if (folder == null) {
+            SharedYouTubeSettings.EXPORT_DOWNLOAD_FOLDER.resetToDefault();
+        } else {
+            resolver.takePersistableUriPermission(folder, FOLDER_PERMISSIONS);
+            SharedYouTubeSettings.EXPORT_DOWNLOAD_FOLDER.save(folder.toString());
+        }
+    }
+
+    /**
+     * @return The folder the user picked, or null to use the default folder.
+     *         If the picked folder can't be used anymore, the default folder is used from now on.
+     */
+    @Nullable
+    private static Uri getPickedFolder(ContentResolver resolver) {
+        String pickedFolder = SharedYouTubeSettings.EXPORT_DOWNLOAD_FOLDER.get();
+        if (pickedFolder.isEmpty()) {
+            return null;
+        }
+
+        Uri tree = Uri.parse(pickedFolder);
+        Uri folder = DocumentsContract.buildDocumentUriUsingTree(tree, DocumentsContract.getTreeDocumentId(tree));
+        if (isFolderAvailable(resolver, folder)) {
+            return folder;
+        }
+
+        Logger.printInfo(() -> "Export folder is not available: " + tree);
+        // Saving to the default folder creates it again, so it is not reported as missing.
+        if (!isDefaultFolder(tree)) {
+            Utils.showToastLong(str("morphe_export_download_folder_missing", getFolderName()));
+        }
+        setFolder(null);
+        return null;
+    }
+
+    /**
+     * @param tree The tree uri of the folder the user picked.
+     * @return If the folder is the folder used by default.
+     */
+    private static boolean isDefaultFolder(Uri tree) {
+        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
+                && DocumentsContract.getTreeDocumentId(tree).equalsIgnoreCase(PRIMARY_VOLUME_PREFIX + DEFAULT_FOLDER);
+    }
+
+    /**
+     * The access to a folder is kept if the folder is deleted, and is missing if the
+     * folder is from imported settings. A documents provider returns no document for a missing folder.
+     */
+    private static boolean isFolderAvailable(ContentResolver resolver, Uri folder) {
+        try (Cursor cursor = resolver.query(folder,
+                new String[]{DocumentsContract.Document.COLUMN_DOCUMENT_ID}, null, null, null)) {
+            return cursor != null && cursor.moveToFirst();
+        } catch (SecurityException ex) {
+            Logger.printInfo(() -> "No access to export folder: " + folder, ex);
+            return false;
+        }
+    }
+
+    /**
+     * Before Android 10, the shared folders need a storage permission, so the folder of the app is used.
+     */
+    private static File getLegacyFolder() {
+        return new File(Utils.getContext().getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), SAVE_FOLDER);
+    }
+
+    // region Saved video data
+
+    /**
+     * @return The saved streams of the video, or null if the video is not fully saved.
+     */
+    @Nullable
+    private static SavedVideo getSavedVideo(String videoId) {
+        for (File database : getDatabases()) {
+            try (SQLiteDatabase db = SQLiteDatabase.openDatabase(
+                    database.getPath(), null, SQLiteDatabase.OPEN_READONLY)) {
+                List<SavedStream> streams = getSavedStreams(db, videoId);
+                if (streams != null) {
+                    return new SavedVideo(getTitle(db, videoId), streams, database);
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Each signed in account has its own database.
+     */
+    private static List<File> getDatabases() {
+        List<File> databases = new ArrayList<>();
+        File folder = Utils.getContext().getDatabasePath(DATABASE_PREFIX).getParentFile();
+        File[] files = folder == null ? null : folder.listFiles();
+        if (files != null) {
+            for (File file : files) {
+                String name = file.getName();
+                if (name.startsWith(DATABASE_PREFIX) && name.endsWith(DATABASE_SUFFIX)) {
+                    databases.add(file);
+                }
+            }
+        }
+        return databases;
+    }
+
+    @Nullable
+    private static List<SavedStream> getSavedStreams(SQLiteDatabase db, String videoId) {
+        List<SavedStream> streams = new ArrayList<>();
+
+        try (Cursor cursor = db.query(
+                "streams",
+                new String[]{"itag", "bytes_total", "bytes_transferred", "encryption_key_type"},
+                "video_id = ?",
+                new String[]{videoId},
+                null, null, null)) {
+            while (cursor.moveToNext()) {
+                final int itag = cursor.getInt(0);
+                final long length = cursor.getLong(1);
+                if (length <= 0 || cursor.getLong(2) != length) {
+                    Logger.printDebug(() -> "Stream is not fully saved: " + videoId + " itag: " + itag);
+                    return null;
+                }
+                final int keyType = cursor.getInt(3);
+                if (keyType != ENCRYPTION_KEY_TYPE_CACHE) {
+                    Logger.printDebug(() -> "Unsupported encryption: " + keyType + " video: " + videoId);
+                    return null;
+                }
+                streams.add(new SavedStream(itag, length));
+            }
+        }
+
+        return streams.isEmpty() ? null : streams;
+    }
+
+    private static String getTitle(SQLiteDatabase db, String videoId) {
+        try (Cursor cursor = db.query(
+                "videosV2",
+                new String[]{"player_response_proto"},
+                "id = ?",
+                new String[]{videoId},
+                null, null, null)) {
+            if (cursor.moveToFirst() && !cursor.isNull(0)) {
+                String title = SavedPlayerResponse.parseFrom(cursor.getBlob(0))
+                        .getVideoDetails().getTitle();
+                if (!title.isEmpty()) {
+                    return title;
+                }
+            }
+        } catch (Exception ex) {
+            Logger.printException(() -> "Could not read the title of: " + videoId, ex);
+        }
+
+        return videoId;
+    }
+
+    /**
+     * @param title The title of the video, used if the song has no title of its own.
+     * @return The title, artist, album and cover of the song, which are written to exported audio files.
+     */
+    private static AudioTagWriter.Tags getTags(File database, String videoId, String title) {
+        try (SQLiteDatabase db = SQLiteDatabase.openDatabase(
+                database.getPath(), null, SQLiteDatabase.OPEN_READONLY);
+             Cursor cursor = db.query(
+                "videosV2",
+                new String[]{"offline_video_data_proto"},
+                "id = ?",
+                new String[]{videoId},
+                null, null, null)) {
+            if (cursor.moveToFirst() && !cursor.isNull(0)) {
+                OfflineVideoData data = OfflineVideoData.parseFrom(cursor.getBlob(0));
+                OfflineMusicMetadata music = data.getMusicVideoData().getMusicMetadata();
+                return new AudioTagWriter.Tags(
+                        music.getTitle().isEmpty() ? title : music.getTitle(),
+                        music.getArtist(),
+                        music.getAlbum(),
+                        getArtwork(database, data.getThumbnail())
+                );
+            }
+        } catch (Exception ex) {
+            Logger.printException(() -> "Could not read the tags of: " + videoId, ex);
+        }
+
+        return new AudioTagWriter.Tags(title, null, null, null);
+    }
+
+    /**
+     * The app saves the thumbnails of saved videos in the folder of the account,
+     * named with the hash code of their url.
+     *
+     * @param database The database of the account.
+     * @return The largest saved thumbnail, or null if none is saved.
+     */
+    @Nullable
+    private static AudioTagWriter.Artwork getArtwork(File database, ThumbnailList thumbnails) throws IOException {
+        String name = database.getName();
+        String account = name.substring(DATABASE_PREFIX.length(), name.length() - DATABASE_SUFFIX.length());
+
+        File image = null;
+        int imageWidth = 0;
+        for (File folder : getOfflineFolders()) {
+            File images = new File(folder, account + File.separator + IMAGES_FOLDER);
+            for (ThumbnailEntry thumbnail : thumbnails.getThumbnailsList()) {
+                if (thumbnail.getWidth() <= imageWidth) {
+                    continue;
+                }
+                File file = findImage(images, thumbnail.getUrl());
+                if (file != null) {
+                    image = file;
+                    imageWidth = thumbnail.getWidth();
+                }
+            }
+        }
+        if (image == null) {
+            return null;
+        }
+
+        byte[] data = Files.readAllBytes(image.toPath());
+        BitmapFactory.Options options = new BitmapFactory.Options();
+        options.inJustDecodeBounds = true;
+        BitmapFactory.decodeByteArray(data, 0, data.length, options);
+        if (options.outWidth <= 0 || options.outHeight <= 0) {
+            File file = image;
+            Logger.printInfo(() -> "Thumbnail is not an image: " + file);
+            return null;
+        }
+        if (IMAGE_JPEG.equals(options.outMimeType) || IMAGE_PNG.equals(options.outMimeType)) {
+            return new AudioTagWriter.Artwork(data, options.outMimeType, options.outWidth, options.outHeight);
+        }
+
+        // Audio files can only hold JPEG and PNG covers.
+        Bitmap bitmap = BitmapFactory.decodeByteArray(data, 0, data.length);
+        if (bitmap == null) {
+            File file = image;
+            Logger.printInfo(() -> "Could not decode thumbnail: " + file);
+            return null;
+        }
+        ByteArrayOutputStream jpeg = new ByteArrayOutputStream();
+        bitmap.compress(Bitmap.CompressFormat.JPEG, ARTWORK_JPEG_QUALITY, jpeg);
+        AudioTagWriter.Artwork artwork = new AudioTagWriter.Artwork(
+                jpeg.toByteArray(), IMAGE_JPEG, bitmap.getWidth(), bitmap.getHeight());
+        bitmap.recycle();
+        return artwork;
+    }
+
+    /**
+     * Thumbnails with a file type in their url keep the end of the url after the hash code,
+     * such as "1274788442.jpg?sqp=...".
+     */
+    @Nullable
+    private static File findImage(File folder, String url) {
+        String hash = String.valueOf(url.hashCode());
+        File file = new File(folder, hash);
+        if (file.isFile()) {
+            return file;
+        }
+        File[] files = folder.listFiles((dir, fileName) -> fileName.startsWith(hash + "."));
+        return files != null && files.length > 0 ? files[0] : null;
+    }
+
+    // endregion
+
+    // region Export
+
+    /**
+     * @param folder The subfolder of the export folder to save the files in, or null if none.
+     */
+    private static ExportResult export(String videoId, SavedVideo video, @Nullable String folder,
+                                       ExportNotification notification) throws Exception {
+        SecretKeySpec key = getKey();
+        List<StreamSource> sources = new ArrayList<>();
+        List<MediaExtractor> extractors = new ArrayList<>();
+        List<MediaFormat> formats = new ArrayList<>();
+
+        try {
+            for (SavedStream stream : video.streams()) {
+                StreamSource source = openStream(key, videoId, stream);
+                sources.add(source);
+
+                MediaExtractor extractor = new MediaExtractor();
+                extractors.add(extractor);
+                extractor.setDataSource(source);
+                if (extractor.getTrackCount() == 0) {
+                    throw new IOException("No track in stream: " + stream.itag());
+                }
+                extractor.selectTrack(0);
+                formats.add(extractor.getTrackFormat(0));
+            }
+            notification.setSources(sources);
+
+            String fileName = getFileName(video.title());
+            // A single stream, such as the audio of a song, is already a complete media file.
+            Integer muxerFormat = sources.size() > 1 ? getMuxerFormat(formats) : null;
+            if (muxerFormat != null) {
+                final boolean webm = muxerFormat == MediaMuxer.OutputFormat.MUXER_OUTPUT_WEBM;
+                String mimeType = webm ? "video/webm" : "video/mp4";
+                OutputFile output = OutputFile.create(folder, fileName, webm ? ".webm" : ".mp4", mimeType);
+                try {
+                    mux(extractors, formats, output.descriptor, muxerFormat, notification);
+                    return new ExportResult(output.finish(), output.uri, mimeType);
+                } catch (Exception ex) {
+                    output.delete();
+                    throw ex;
+                }
+            }
+
+            // The streams can't be muxed together on this device, so each stream is saved as its own file.
+            // The streams are complete media files, so they play by themselves.
+            final boolean multipleStreams = sources.size() > 1;
+            ExportResult result = null;
+            // If a stream can't be saved, the other streams are deleted too, so no partial export is left.
+            List<OutputFile> finished = new ArrayList<>();
+            for (int i = 0, size = sources.size(); i < size; i++) {
+                String codec = formats.get(i).getString(MediaFormat.KEY_MIME);
+                String mimeType = getMimeType(codec);
+                final boolean audio = mimeType.startsWith("audio/");
+                // Opus is written to an Ogg file, see AudioTagWriter.
+                final boolean opus = MediaFormat.MIMETYPE_AUDIO_OPUS.equals(codec);
+                final boolean aac = MediaFormat.MIMETYPE_AUDIO_AAC.equals(codec);
+                final boolean webm = WEBM_MIME_TYPES.contains(codec);
+                String extension = opus ? ".opus" : (webm ? ".webm" : (audio ? ".m4a" : ".mp4"));
+                OutputFile output = OutputFile.create(
+                        folder,
+                        fileName + (audio && multipleStreams ? " (audio)" : ""),
+                        extension,
+                        mimeType
+                );
+                try {
+                    // Audio files get the title, artist, album and cover of the song.
+                    if (opus || aac) {
+                        AudioTagWriter.Tags tags = getTags(video.database(), videoId, video.title());
+                        try (OutputStream stream = new FileOutputStream(output.descriptor.getFileDescriptor())) {
+                            if (opus) {
+                                AudioTagWriter.writeOggOpus(extractors.get(i), formats.get(i), videoId.hashCode(),
+                                        stream, tags, notification::showProgress);
+                            } else {
+                                AudioTagWriter.writeMp4(sources.get(i), stream, tags, notification::showProgress);
+                            }
+                        }
+                    } else {
+                        copy(sources.get(i), output.descriptor, notification);
+                    }
+                    String location = output.finish();
+                    finished.add(output);
+                    // The notification opens the video file.
+                    if (result == null || !audio) {
+                        result = new ExportResult(location, output.uri, mimeType);
+                    }
+                } catch (Exception ex) {
+                    output.delete();
+                    for (OutputFile file : finished) {
+                        file.delete();
+                    }
+                    throw ex;
+                }
+            }
+            return result;
+        } finally {
+            for (MediaExtractor extractor : extractors) {
+                extractor.release();
+            }
+            for (StreamSource source : sources) {
+                source.close();
+            }
+        }
+    }
+
+    private static SecretKeySpec getKey() {
+        String key = Utils.getContext()
+                .getSharedPreferences(KEY_PREFERENCES_NAME, Context.MODE_PRIVATE)
+                .getString(KEY_PREFERENCE, null);
+        if (key == null) {
+            throw new IllegalStateException("No downloads encryption key");
+        }
+        return new SecretKeySpec(Base64.decode(key, Base64.DEFAULT), "AES");
+    }
+
+    /**
+     * @return The MediaMuxer output format for the streams, or null if the streams can't be muxed together.
+     */
+    @Nullable
+    private static Integer getMuxerFormat(List<MediaFormat> formats) {
+        boolean webm = false;
+        boolean mp4 = false;
+        for (MediaFormat format : formats) {
+            String mime = format.getString(MediaFormat.KEY_MIME);
+            if (WEBM_MIME_TYPES.contains(mime)) {
+                webm = true;
+            } else if (MP4_MIME_TYPES.contains(mime)) {
+                if (MIMETYPE_VIDEO_AV1.equals(mime) && Build.VERSION.SDK_INT < AV1_MUXER_MIN_SDK) {
+                    return null;
+                }
+                mp4 = true;
+            } else {
+                return null;
+            }
+        }
+
+        if (webm == mp4) {
+            return null;
+        }
+        return webm
+                ? MediaMuxer.OutputFormat.MUXER_OUTPUT_WEBM
+                : MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4;
+    }
+
+    /**
+     * @param mime The codec of a stream.
+     * @return The type of the file the stream is exported to.
+     */
+    private static String getMimeType(@Nullable String mime) {
+        if (MediaFormat.MIMETYPE_AUDIO_OPUS.equals(mime)) {
+            return OGG_MIME_TYPE;
+        }
+        final boolean audio = mime != null && mime.startsWith("audio/");
+        if (WEBM_MIME_TYPES.contains(mime)) {
+            return audio ? "audio/webm" : "video/webm";
+        }
+        return audio ? "audio/mp4" : "video/mp4";
+    }
+
+    private static String getFileName(String title) {
+        String name = title.replaceAll("[\\\\/:*?\"<>|\\p{Cntrl}]", "_").trim();
+        return name.length() > MAX_FILE_NAME_LENGTH
+                ? name.substring(0, MAX_FILE_NAME_LENGTH).trim()
+                : name;
+    }
+
+    /**
+     * Writes the samples of all streams in the order of their time, so the file is interleaved.
+     */
+    private static void mux(List<MediaExtractor> extractors, List<MediaFormat> formats,
+                            ParcelFileDescriptor descriptor, int outputFormat,
+                            ExportNotification notification) throws IOException {
+        MediaMuxer muxer = new MediaMuxer(descriptor.getFileDescriptor(), outputFormat);
+        try {
+            final int count = extractors.size();
+            int[] tracks = new int[count];
+            for (int i = 0; i < count; i++) {
+                tracks[i] = muxer.addTrack(formats.get(i));
+            }
+            muxer.start();
+
+            ByteBuffer buffer = ByteBuffer.allocate(SAMPLE_BUFFER_SIZE);
+            MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+            while (true) {
+                int next = -1;
+                long nextTime = Long.MAX_VALUE;
+                for (int i = 0; i < count; i++) {
+                    final long time = extractors.get(i).getSampleTime();
+                    if (time >= 0 && time < nextTime) {
+                        next = i;
+                        nextTime = time;
+                    }
+                }
+                if (next < 0) {
+                    break;
+                }
+
+                MediaExtractor extractor = extractors.get(next);
+                final int size = extractor.readSampleData(buffer, 0);
+                if (size < 0) {
+                    break;
+                }
+                final boolean keyFrame = (extractor.getSampleFlags() & MediaExtractor.SAMPLE_FLAG_SYNC) != 0;
+                info.set(0, size, nextTime, keyFrame ? MediaCodec.BUFFER_FLAG_KEY_FRAME : 0);
+                muxer.writeSampleData(tracks[next], buffer, info);
+                extractor.advance();
+                notification.showProgress();
+            }
+
+            muxer.stop();
+        } finally {
+            muxer.release();
+        }
+    }
+
+    private static void copy(StreamSource source, ParcelFileDescriptor descriptor,
+                             ExportNotification notification) throws IOException {
+        try (OutputStream output = new FileOutputStream(descriptor.getFileDescriptor())) {
+            byte[] buffer = new byte[COPY_BUFFER_SIZE];
+            long position = 0;
+            int read;
+            while ((read = source.readAt(position, buffer, 0, buffer.length)) > 0) {
+                output.write(buffer, 0, read);
+                position += read;
+                notification.showProgress();
+            }
+        }
+    }
+
+    /**
+     * A file in the folder the user picked, or by default in the shared Download folder.
+     *
+     * @param document If the uri is of a document in the folder the user picked, and not of the media store.
+     */
+    private record OutputFile(@Nullable Uri uri, boolean document, @Nullable File file,
+                              ParcelFileDescriptor descriptor, String location) {
+
+        /**
+         * Files are never replaced. If the name is taken, a number is added to it.
+         *
+         * @param subfolder The folder in the export folder to create the file in, or null if none.
+         */
+        static OutputFile create(@Nullable String subfolder, String name, String extension, String mimeType)
+                throws IOException {
+            ContentResolver resolver = Utils.getContext().getContentResolver();
+            String subfolderPath = subfolder == null ? "" : File.separator + subfolder;
+
+            Uri pickedFolder = getPickedFolder(resolver);
+            if (pickedFolder != null) {
+                Uri parent = subfolder == null ? pickedFolder : getDocumentFolder(resolver, pickedFolder, subfolder);
+                // The documents provider adds a number to a name that is taken.
+                Uri uri = DocumentsContract.createDocument(resolver, parent, mimeType, name + extension);
+                if (uri == null) {
+                    throw new IOException("Could not create file: " + name + extension + " in: " + parent);
+                }
+                ParcelFileDescriptor descriptor = resolver.openFileDescriptor(uri, "rw");
+                if (descriptor == null) {
+                    DocumentsContract.deleteDocument(resolver, uri);
+                    throw new IOException("No file descriptor for: " + uri);
+                }
+                return new OutputFile(uri, true, null, descriptor, getFolderName() + subfolderPath);
+            }
+
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+                File folder = new File(getLegacyFolder().getPath() + subfolderPath);
+                if (!folder.exists() && !folder.mkdirs()) {
+                    throw new IOException("Could not create folder: " + folder);
+                }
+                for (int attempt = 0; attempt < MAX_FILE_NAME_ATTEMPTS; attempt++) {
+                    File file = new File(folder, getNumberedName(name, extension, attempt));
+                    if (file.createNewFile()) {
+                        ParcelFileDescriptor descriptor = ParcelFileDescriptor.open(file,
+                                ParcelFileDescriptor.MODE_READ_WRITE);
+                        return new OutputFile(null, false, file, descriptor, folder.getPath());
+                    }
+                }
+                throw new IOException("Could not create file: " + name + extension);
+            }
+
+            String folder = DEFAULT_FOLDER + subfolderPath;
+            ContentValues values = new ContentValues();
+            values.put(MediaStore.MediaColumns.MIME_TYPE, mimeType);
+            values.put(MediaStore.MediaColumns.RELATIVE_PATH, folder);
+            values.put(MediaStore.MediaColumns.IS_PENDING, 1);
+
+            // The media store renames a file whose name is taken, but Android 10 adds the number
+            // after the extension, so a free name is picked first. The insert fails if the file
+            // was deleted without the media store knowing, such as by a file manager.
+            Uri uri = null;
+            for (int attempt = 0; uri == null && attempt < MAX_FILE_NAME_ATTEMPTS; attempt++) {
+                String fileName = getNumberedName(name, extension, attempt);
+                if (isMediaStoreNameTaken(resolver, folder, fileName)) {
+                    continue;
+                }
+                values.put(MediaStore.MediaColumns.DISPLAY_NAME, fileName);
+                uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+            }
+            if (uri == null) {
+                throw new IOException("Could not create file: " + name + extension);
+            }
+            ParcelFileDescriptor descriptor = resolver.openFileDescriptor(uri, "rw");
+            if (descriptor == null) {
+                resolver.delete(uri, null, null);
+                throw new IOException("No file descriptor for: " + uri);
+            }
+            return new OutputFile(uri, false, null, descriptor, folder);
+        }
+
+        /**
+         * @return The folder with the name in the parent folder the user picked, which is created if needed.
+         */
+        private static Uri getDocumentFolder(ContentResolver resolver, Uri parent, String name) throws IOException {
+            Uri children = DocumentsContract.buildChildDocumentsUriUsingTree(
+                    parent, DocumentsContract.getDocumentId(parent));
+            // Documents providers ignore query selections, so the children are compared here.
+            try (Cursor cursor = resolver.query(children, new String[]{
+                    DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                    DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                    DocumentsContract.Document.COLUMN_MIME_TYPE
+            }, null, null, null)) {
+                while (cursor != null && cursor.moveToNext()) {
+                    if (name.equals(cursor.getString(1))
+                            && DocumentsContract.Document.MIME_TYPE_DIR.equals(cursor.getString(2))) {
+                        return DocumentsContract.buildDocumentUriUsingTree(parent, cursor.getString(0));
+                    }
+                }
+            }
+
+            Uri folder = DocumentsContract.createDocument(resolver, parent,
+                    DocumentsContract.Document.MIME_TYPE_DIR, name);
+            if (folder == null) {
+                throw new IOException("Could not create folder: " + name + " in: " + parent);
+            }
+            return folder;
+        }
+
+        /**
+         * Only the files the app created can be found, as other files are not visible to the app.
+         */
+        @RequiresApi(Build.VERSION_CODES.Q)
+        private static boolean isMediaStoreNameTaken(ContentResolver resolver, String folder, String fileName) {
+            try (Cursor cursor = resolver.query(MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                    new String[]{MediaStore.MediaColumns._ID},
+                    MediaStore.MediaColumns.RELATIVE_PATH + " = ? AND "
+                            + MediaStore.MediaColumns.DISPLAY_NAME + " = ?",
+                    new String[]{folder + File.separator, fileName},
+                    null)) {
+                return cursor != null && cursor.moveToFirst();
+            }
+        }
+
+        private static String getNumberedName(String name, String extension, int number) {
+            return (number == 0 ? name : name + " (" + number + ")") + extension;
+        }
+
+        /**
+         * @return Where the file is saved, as shown to the user.
+         */
+        String finish() throws IOException {
+            descriptor.close();
+            if (uri != null && !document) {
+                ContentValues values = new ContentValues();
+                values.put(MediaStore.MediaColumns.IS_PENDING, 0);
+                Utils.getContext().getContentResolver().update(uri, values, null, null);
+            }
+            return location;
+        }
+
+        void delete() throws IOException {
+            descriptor.close();
+            ContentResolver resolver = Utils.getContext().getContentResolver();
+            if (uri != null && document) {
+                DocumentsContract.deleteDocument(resolver, uri);
+            } else if (uri != null) {
+                resolver.delete(uri, null, null);
+            } else if (file != null && !file.delete()) {
+                Logger.printInfo(() -> "Could not delete: " + file);
+            }
+        }
+    }
+
+    /**
+     * Shows the progress of an export, which takes a while for long videos.
+     */
+    private static final class ExportNotification {
+        private final int id;
+        private final String title;
+        private final PendingIntent cancelIntent;
+        private final BroadcastReceiver cancelReceiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                canceled = true;
+            }
+        };
+        private volatile boolean canceled;
+        private List<StreamSource> sources = List.of();
+        /**
+         * The size of all videos of the export.
+         */
+        private final long length;
+        /**
+         * The size of the videos that are done, if the export has several videos.
+         */
+        private long finishedLength;
+        /**
+         * The video being exported, if the export has several videos.
+         */
+        @Nullable
+        private String videoTitle;
+        private long nextUpdateTime;
+
+        /**
+         * @param length The size of all videos of the export.
+         */
+        @SuppressLint("UnspecifiedRegisterReceiverFlag") // The flags only exist with Android 13 and newer.
+        ExportNotification(int id, String title, long length) {
+            this.id = id;
+            this.title = title;
+            this.length = length;
+
+            Context context = Utils.getContext();
+            String action = CANCEL_ACTION_PREFIX + id;
+            IntentFilter filter = new IntentFilter(action);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                context.registerReceiver(cancelReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+            } else {
+                context.registerReceiver(cancelReceiver, filter);
+            }
+            cancelIntent = PendingIntent.getBroadcast(context, id,
+                    new Intent(action).setPackage(context.getPackageName()),
+                    PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+
+            postProgress();
+        }
+
+        void setSources(List<StreamSource> sources) {
+            this.sources = sources;
+        }
+
+        /**
+         * Called when the next video of an export of several videos starts.
+         */
+        void setVideo(String title) {
+            videoTitle = title;
+            sources = List.of();
+            nextUpdateTime = 0;
+            postProgress();
+        }
+
+        /**
+         * Called when a video of an export of several videos is done, also if it failed.
+         */
+        void finishVideo(long videoLength) {
+            finishedLength += videoLength;
+            sources = List.of();
+        }
+
+        /**
+         * Called while the export is written.
+         *
+         * @throws ExportCanceledException If the export was canceled with the notification.
+         */
+        void showProgress() throws ExportCanceledException {
+            if (canceled) {
+                throw new ExportCanceledException();
+            }
+            postProgress();
+        }
+
+        private void postProgress() {
+            final long now = System.currentTimeMillis();
+            if (now < nextUpdateTime) {
+                return;
+            }
+            nextUpdateTime = now + NOTIFICATION_INTERVAL_MILLISECONDS;
+
+            long read = finishedLength;
+            for (StreamSource source : sources) {
+                read += source.getReadEnd();
+            }
+            final int progress = length == 0 ? 0 : (int) (Math.min(read, length) * PROGRESS_MAX / length);
+
+            Notification.Builder builder = createBuilder()
+                    .setSmallIcon(android.R.drawable.stat_sys_download)
+                    .setContentText(str("morphe_export_download_progress", progress))
+                    .setSubText(videoTitle)
+                    .setProgress(PROGRESS_MAX, progress, length == 0)
+                    .setOngoing(true)
+                    .addAction(new Notification.Action.Builder(
+                            Icon.createWithResource(Utils.getContext(), android.R.drawable.ic_menu_close_clear_cancel),
+                            Utils.getContext().getString(android.R.string.cancel),
+                            cancelIntent).build());
+            post(builder);
+        }
+
+        /**
+         * @param uri The file the notification opens, or null if there is none.
+         */
+        void showResult(String text, @Nullable Uri uri, @Nullable String mimeType) {
+            stopCancelReceiver();
+            Notification.Builder builder = createBuilder()
+                    .setSmallIcon(android.R.drawable.stat_sys_download_done)
+                    .setContentText(text)
+                    .setAutoCancel(true);
+            if (uri != null) {
+                Intent intent = new Intent(Intent.ACTION_VIEW)
+                        .setDataAndType(uri, mimeType)
+                        .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
+                builder.setContentIntent(PendingIntent.getActivity(Utils.getContext(), id, intent,
+                        PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT));
+            }
+            post(builder);
+        }
+
+        /**
+         * Removes the notification of a canceled export.
+         */
+        void dismiss() {
+            stopCancelReceiver();
+            getManager().cancel(id);
+        }
+
+        private void stopCancelReceiver() {
+            Utils.getContext().unregisterReceiver(cancelReceiver);
+            cancelIntent.cancel();
+        }
+
+        private static NotificationManager getManager() {
+            return (NotificationManager) Utils.getContext().getSystemService(Context.NOTIFICATION_SERVICE);
+        }
+
+        private Notification.Builder createBuilder() {
+            return new Notification.Builder(Utils.getContext(), NOTIFICATION_CHANNEL)
+                    .setContentTitle(title)
+                    .setOnlyAlertOnce(true);
+        }
+
+        private void post(Notification.Builder builder) {
+            NotificationManager manager = getManager();
+            manager.createNotificationChannel(new NotificationChannel(NOTIFICATION_CHANNEL,
+                    str("morphe_export_download_notification_channel"),
+                    NotificationManager.IMPORTANCE_LOW));
+            manager.notify(id, builder.build());
+        }
+    }
+
+    // endregion
+
+    // region Cache
+
+    private static StreamSource openStream(SecretKeySpec key, String videoId, SavedStream stream) throws Exception {
+        // Cache keys are the video id, the itag and the last modified time of the stream,
+        // such as "videoId.140.1758733303850123". If the video has several audio tracks,
+        // the audio track is after the itag: "videoId.140:audioTrack.1758733303850123".
+        final String keyPrefix = videoId + "." + stream.itag();
+
+        for (File streamsFolder : getStreamsFolders()) {
+            Map<Integer, String> index = readCacheIndex(new File(streamsFolder, CACHE_INDEX_FILE), key);
+
+            int id = -1;
+            String cacheKey = null;
+            long newestTime = -1;
+            for (Map.Entry<Integer, String> entry : index.entrySet()) {
+                String entryKey = entry.getValue();
+                if (entryKey.length() > keyPrefix.length() && entryKey.startsWith(keyPrefix)
+                        && (entryKey.charAt(keyPrefix.length()) == '.' || entryKey.charAt(keyPrefix.length()) == ':')) {
+                    final long time = Long.parseLong(entryKey.substring(entryKey.lastIndexOf('.') + 1));
+                    if (time > newestTime) {
+                        newestTime = time;
+                        id = entry.getKey();
+                        cacheKey = entryKey;
+                    }
+                }
+            }
+            if (cacheKey == null) {
+                continue;
+            }
+
+            TreeMap<Long, File> spans = getSpans(streamsFolder, id);
+            long end = 0;
+            for (Map.Entry<Long, File> span : spans.entrySet()) {
+                if (span.getKey() != end) {
+                    break;
+                }
+                end += span.getValue().length();
+            }
+            if (end != stream.length()) {
+                throw new IOException("Stream is incomplete: " + cacheKey
+                        + " saved: " + end + " length: " + stream.length());
+            }
+
+            return new StreamSource(key, cacheKey, spans, stream.length());
+        }
+
+        throw new IOException("Stream not found: " + keyPrefix);
+    }
+
+    /**
+     * @return The folders of the saved videos, on the internal storage or on an SD card.
+     *         Each account has its own folder in them.
+     */
+    private static List<File> getOfflineFolders() {
+        Context context = Utils.getContext();
+        List<File> folders = new ArrayList<>();
+        for (File root : context.getExternalFilesDirs(null)) {
+            if (root != null) {
+                folders.add(new File(root, OFFLINE_FOLDER));
+            }
+        }
+        folders.add(new File(context.getFilesDir(), OFFLINE_FOLDER));
+        return folders;
+    }
+
+    private static List<File> getStreamsFolders() {
+        List<File> folders = new ArrayList<>();
+        for (File offlineFolder : getOfflineFolders()) {
+            File[] accounts = offlineFolder.listFiles();
+            if (accounts == null) {
+                continue;
+            }
+            for (File account : accounts) {
+                File streams = new File(account, STREAMS_FOLDER);
+                if (new File(streams, CACHE_INDEX_FILE).isFile()) {
+                    folders.add(streams);
+                }
+            }
+        }
+        return folders;
+    }
+
+    /**
+     * Reads the ExoPlayer cache index, which maps the ids in the span file names to the cache keys.
+     */
+    private static Map<Integer, String> readCacheIndex(File file, SecretKeySpec key) throws Exception {
+        try (DataInputStream input = new DataInputStream(new BufferedInputStream(new FileInputStream(file)))) {
+            final int version = input.readInt();
+            if (version != CACHE_INDEX_VERSION) {
+                throw new IOException("Unsupported cache index version: " + version);
+            }
+
+            DataInputStream data = input;
+            if ((input.readInt() & CACHE_INDEX_FLAG_ENCRYPTED) != 0) {
+                byte[] iv = new byte[AES_BLOCK_SIZE];
+                input.readFully(iv);
+                Cipher cipher = Cipher.getInstance(INDEX_CIPHER);
+                cipher.init(Cipher.DECRYPT_MODE, key, new IvParameterSpec(iv));
+                data = new DataInputStream(new CipherInputStream(input, cipher));
+            }
+
+            Map<Integer, String> index = new HashMap<>();
+            final int count = data.readInt();
+            for (int i = 0; i < count; i++) {
+                final int id = data.readInt();
+                index.put(id, data.readUTF());
+                // Metadata, such as the redirected url.
+                final int metadataCount = data.readInt();
+                for (int m = 0; m < metadataCount; m++) {
+                    data.readUTF();
+                    data.readFully(new byte[data.readInt()]);
+                }
+            }
+            return index;
+        }
+    }
+
+    /**
+     * Span files are named "id.position.time.v3.exo" and are in numbered sub folders.
+     */
+    private static TreeMap<Long, File> getSpans(File streamsFolder, int id) {
+        TreeMap<Long, File> spans = new TreeMap<>();
+        String prefix = id + ".";
+        File[] folders = streamsFolder.listFiles(File::isDirectory);
+        if (folders == null) {
+            return spans;
+        }
+        for (File folder : folders) {
+            File[] files = folder.listFiles();
+            if (files == null) {
+                continue;
+            }
+            for (File file : files) {
+                String name = file.getName();
+                if (name.startsWith(prefix) && name.endsWith(SPAN_FILE_SUFFIX)) {
+                    String position = name.substring(prefix.length(), name.indexOf('.', prefix.length()));
+                    spans.put(Long.parseLong(position), file);
+                }
+            }
+        }
+        return spans;
+    }
+
+    /**
+     * Reads a saved stream and decrypts it, the same as the ExoPlayer AesCipherDataSource of the app.
+     */
+    private static final class StreamSource extends MediaDataSource {
+        private final SecretKeySpec key;
+        private final long nonce;
+        private final TreeMap<Long, File> spans;
+        private final long length;
+        private final Map<Long, RandomAccessFile> openFiles = new HashMap<>();
+        /**
+         * The end of the furthest read, for the progress of the export.
+         */
+        private volatile long readEnd;
+
+        /**
+         * The cipher is reused for sequential reads, and set up again when reading another position.
+         */
+        @Nullable
+        private Cipher cipher;
+        private long cipherPosition = -1;
+
+        StreamSource(SecretKeySpec key, String cacheKey, TreeMap<Long, File> spans, long length) {
+            this.key = key;
+            this.nonce = getNonce(cacheKey);
+            this.spans = spans;
+            this.length = length;
+        }
+
+        /**
+         * The FNV-1 hash ExoPlayer uses as the nonce of a cache key.
+         */
+        private static long getNonce(String cacheKey) {
+            long hash = 0;
+            for (int i = 0, length = cacheKey.length(); i < length; i++) {
+                hash ^= cacheKey.charAt(i);
+                hash += (hash << 1) + (hash << 4) + (hash << 5) + (hash << 7) + (hash << 8) + (hash << 40);
+            }
+            return hash;
+        }
+
+        @Override
+        public synchronized int readAt(long position, byte[] buffer, int offset, int size) throws IOException {
+            if (position >= length) {
+                return -1;
+            }
+
+            Map.Entry<Long, File> span = spans.floorEntry(position);
+            if (span == null) {
+                throw new IOException("No span at: " + position);
+            }
+            final long spanStart = span.getKey();
+            final int count = (int) Math.min(size, spanStart + span.getValue().length() - position);
+
+            RandomAccessFile file = openFiles.get(spanStart);
+            if (file == null) {
+                file = new RandomAccessFile(span.getValue(), "r");
+                openFiles.put(spanStart, file);
+            }
+            file.seek(position - spanStart);
+            file.readFully(buffer, offset, count);
+
+            decrypt(position, buffer, offset, count);
+            readEnd = Math.max(readEnd, position + count);
+            return count;
+        }
+
+        private void decrypt(long position, byte[] buffer, int offset, int count) throws IOException {
+            try {
+                Cipher current = cipher;
+                if (current == null || position != cipherPosition) {
+                    current = Cipher.getInstance(CACHE_CIPHER);
+                    byte[] iv = ByteBuffer.allocate(AES_BLOCK_SIZE)
+                            .putLong(nonce)
+                            .putLong(position / AES_BLOCK_SIZE)
+                            .array();
+                    current.init(Cipher.DECRYPT_MODE, key, new IvParameterSpec(iv));
+                    final int skip = (int) (position % AES_BLOCK_SIZE);
+                    if (skip > 0) {
+                        current.update(new byte[skip]);
+                    }
+                    cipher = current;
+                }
+
+                final int decrypted = current.update(buffer, offset, count, buffer, offset);
+                if (decrypted != count) {
+                    throw new IOException("Decrypted " + decrypted + " of " + count + " bytes");
+                }
+                cipherPosition = position + count;
+            } catch (GeneralSecurityException ex) {
+                throw new IOException(ex);
+            }
+        }
+
+        @Override
+        public long getSize() {
+            return length;
+        }
+
+        long getReadEnd() {
+            return readEnd;
+        }
+
+        @Override
+        public synchronized void close() throws IOException {
+            for (RandomAccessFile file : openFiles.values()) {
+                file.close();
+            }
+            openFiles.clear();
+        }
+    }
+
+    // endregion
+}
